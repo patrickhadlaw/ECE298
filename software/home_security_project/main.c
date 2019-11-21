@@ -1,4 +1,5 @@
 #include "terminal.h"
+#include "buzzer.h"
 
 void init() {
     Init_LCD();
@@ -236,7 +237,7 @@ int main(void)
 {
 	WDTCTL = WDTPW | WDTHOLD;	// stop watchdog timer
     PM5CTL0 &= ~LOCKLPM5;
-	
+
 	init();
 
     GPIO_setOutputLowOnPin(GPIO_PORT_P5, GPIO_PIN1);
@@ -259,7 +260,7 @@ int main(void)
 
     clearLCD();
 
-    enum ZoneState global_status = STANDBY;
+    //enum ZoneState global_status = STANDBY;
     enum ZoneState zone_status[4];
     int reed_trigger_count[4];
     memset(zone_status, 0, 4 * sizeof(enum ZoneState));
