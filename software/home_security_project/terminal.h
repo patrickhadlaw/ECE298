@@ -3,10 +3,15 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 
 #include "driverlib/driverlib.h"
 #include "hal_LCD.h"
+
+#define TERMINAL_CLEAR_LINES 250
+
+extern bool terminal_enabled;
 
 typedef void(*ProgramFun) (char*);
 
@@ -22,9 +27,13 @@ struct lcd_terminal_program {
 
 void Clock_init();
 int Terminal_init();
+void Terminal_enable();
+void Terminal_disable();
 void Terminal_close();
 
 int Terminal_printf(const char* format, ...);
+
+int Terminal_clear();
 
 void EUSCIA0_ISR(void);
 
