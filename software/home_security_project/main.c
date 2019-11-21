@@ -1,10 +1,14 @@
 #include "keypad.h"
+#include "buzzer.h"
+#include "microphone.h"
 
 void init() {
     Init_LCD();
     Clock_init();
     Terminal_init();
     Keypad_init();
+    PWM_init();
+    Microphone_init();
 
     // LEDs
     GPIO_setAsOutputPin(GPIO_PORT_P5, GPIO_PIN1);
@@ -125,7 +129,7 @@ void print_terminal_header() {
     Terminal_printf("----------------------------------------------------------\r\n");
     Terminal_printf("    Home Security System\r\n");
     Terminal_printf("    By: Patrick Hadlaw & Erik Kuhne\r\n");
-    Terminal_printf("----------------------------------------------------------\r\n\r\n\r\n\r\n");
+    Terminal_printf("----------------------------------------------------------\r\n");
 }
 
 struct ZoneTime {
@@ -134,33 +138,74 @@ struct ZoneTime {
 };
 
 struct ZoneTime zone_times[4];
+bool zone_armed[4];
+enum ZoneState zone_status[4];
+bool reed_open[4];
+int max_mic_reading = 0;
 
 void print_screen(enum TerminalScreen screen) {
     print_terminal_header();
+    if (screen == HOME_SCREEN || screen == ALARM_SCREEN || screen == ARMED_SCREEN) {
+        Terminal_printf("System Status: \r\n");
+
+        int i;
+        for (i = 0; i < 4; i++) {
+            Terminal_printf("Zone #%d: ", i + 1);
+            if (zone_status[i] == ALARM) {
+                Terminal_printf("ALARM");
+            }
+            else {
+                Terminal_printf("STANDBY");
+            }
+            Terminal_printf("\r\n");
+        }
+
+        Terminal_printf("\r\n");
+
+        for (i = 0; i < 4; i++) {
+            Terminal_printf("Reed Switch #%d: ", i + 1);
+            if (reed_open[i]) {
+                Terminal_printf("OPEN");
+            }
+            else {
+                Terminal_printf("CLOSED");
+            }
+            Terminal_printf("\r\n");
+        }
+
+        Terminal_printf("----------------------------------------------------------\r\n");
+    }
+
     if (screen == SET_PASSWORD_SCREEN) {
-        Terminal_printf("Enter your 4 number PIN (using the keypad): ");
+        Terminal_printf("\r\n\r\nEnter your 4 number PIN (using the keypad): ");
     }
     else if (screen == HOME_SCREEN) {
         Terminal_printf("Zone activation settings:\r\n");
         int i;
         for (i = 0; i < 4; i++) {
             Terminal_printf(
-                    "[%d] %d:%d - %d:%d\r\n",
+                    "[%d] %d:%d - %d:%d",
                     i + 1,
                     (zone_times[i].start_time / 60),
                     (zone_times[i].start_time % 60),
                     (zone_times[i].end_time / 60),
                     (zone_times[i].end_time % 60)
             );
+            if (zone_armed[i]) {
+                Terminal_printf(" - ARMED");
+            }
+            Terminal_printf("\r\n");
         }
+        Terminal_printf("----------------------------------------------------------\r\n");
 
         Terminal_printf("\r\n\r\nSelect the following options using the keypad:\r\n\r\n");
         Terminal_printf("1) Change arm activation times\r\n");
         Terminal_printf("2) ARM the system\r\n");
     }
     else if (screen == ALARM_SCREEN) {
-        Terminal_printf("***WARNING***\r\n");
+        Terminal_printf("***ALERT***\r\n");
         Terminal_printf("Intruder detected!\r\n");
+
         Terminal_printf("Enter your PIN to disarm system: ");
     }
     else if (screen == ARMED_SCREEN) {
@@ -175,6 +220,15 @@ void print_screen(enum TerminalScreen screen) {
     }
 }
 
+int num_digits(int num) {
+    int i = 0;
+    while (num > 0) {
+        num /= 10;
+        i++;
+    }
+    return i;
+}
+
 /**
  * main.c
  */
@@ -182,7 +236,7 @@ int main(void)
 {
 	WDTCTL = WDTPW | WDTHOLD;	// stop watchdog timer
     PM5CTL0 &= ~LOCKLPM5;
-	
+
 	init();
 
     GPIO_setOutputLowOnPin(GPIO_PORT_P5, GPIO_PIN1);
@@ -195,20 +249,9 @@ int main(void)
 
     display_text_scroll("HOME SECURITY SYSTEM", true);
 
-//    set_mux_control(0);
-////    GPIO_setOutputLowOnPin(GPIO_PORT_P1, GPIO_PIN1);
-////    GPIO_setOutputLowOnPin(GPIO_PORT_P1, GPIO_PIN0);
-////    GPIO_setOutputHighOnPin(GPIO_PORT_P2, GPIO_PIN7);
-//
-//    if (GPIO_getInputPinValue(GPIO_PORT_P1, GPIO_PIN4)) {
-//        GPIO_setOutputHighOnPin(GPIO_PORT_P8, GPIO_PIN2);
-//    }
-
     clearLCD();
 
     enum ZoneState global_status = STANDBY;
-    enum ZoneState zone_status[4];
-    bool zone_armed[4];
     memset(zone_times, 0, 4 * sizeof(struct ZoneTime));
     zone_armed[0] = true;
     zone_armed[1] = true;
@@ -217,6 +260,7 @@ int main(void)
     int reed_trigger_count[4];
     memset(zone_status, 0, 4 * sizeof(enum ZoneState));
     memset(reed_trigger_count, 0, 4 * sizeof(int));
+    memset(reed_open, 0, 4 * sizeof(bool));
 
     int password[4];
     int password_check[4];
@@ -229,11 +273,19 @@ int main(void)
     int minute_upper = -1;
     int minute_lower = -1;
 
+    int mic_data[4];
+    memset(mic_data, 0, 4 * sizeof(int));
+
     int check_count = 0;
-    int last_light = 0;
+    long long last_light = 0;
+    long long last_mic_update = 0;
+    int last_mic_strlen = 0;
     bool blink_on = false;
 
     while(1) {
+
+        enum TerminalScreen last_screen = screen;
+
         if (check_count >= 100) {
             Keypad_poll();
 
@@ -260,7 +312,7 @@ int main(void)
                     print_screen(screen);
                 }
             }
-            else if (screen == ALARM_SCREEN) {
+            else if (screen == ALARM_SCREEN || screen == ARMED_SCREEN) {
                 if (key != NONE && key != KEY_STAR && key != KEY_NUM) {
                    password_check[password_counter] = key;
                    password_counter++;
@@ -272,6 +324,7 @@ int main(void)
                            check &= password_check[i] == password[i];
                        }
                        if (check) {
+                          Buzzer_off();
                           global_status = STANDBY;
                           zone_status[0] = STANDBY;
                           set_zone_led(0, 0x0);
@@ -338,24 +391,17 @@ int main(void)
                             zone_times[selected_zone - 1].end_time = tval;
                         }
                         zone_armed[selected_zone - 1] = zone_times[selected_zone - 1].start_time == zone_times[selected_zone - 1].end_time;
-                        hour_upper = -1;
-                        hour_lower = -1;
-                        minute_upper = -1;
-                        minute_lower = -1;
-                        set_start_time = -1;
                         screen = HOME_SCREEN;
                         print_screen(screen);
                     }
                 }
                 else if (key == KEY_STAR) {
-                    set_start_time = -1;
-                    hour_upper = -1;
-                    hour_lower = -1;
-                    minute_upper = -1;
-                    minute_lower = -1;
                     screen = TIME_EDITOR_ZONE_SELECT_SCREEN;
                     print_screen(screen);
                 }
+            }
+            if (last_screen != screen && screen != TIME_EDITOR_SCREEN) {
+                password_counter = 0;
             }
             int time_in_mins = rtc / 600000;
             showChar('0', pos2);
@@ -368,31 +414,99 @@ int main(void)
             uint8_t i;
             for (i = 0; i < 4; i++) {
                 if (zone_times[i].start_time != zone_times[i].end_time) {
+                    bool last = zone_armed[i];
                     if (time_in_mins >= zone_times[i].start_time && time_in_mins <= zone_times[i].end_time) {
                         zone_armed[i] = true;
                     }
                     else {
                         zone_armed[i] = false;
                     }
+                    if (last != zone_armed[i] && screen == HOME_SCREEN) {
+                        print_screen(screen);
+                    }
                 }
+                bool last_reading = reed_open[i];
                 if (!read_reed_sw(i)) {
                     reed_trigger_count[i]++;
-                    if (zone_armed[i] && reed_trigger_count[i] >= 10) {
+                    if (screen != SET_PASSWORD_SCREEN && zone_armed[i] && reed_trigger_count[i] >= 10) {
                         zone_status[i] = ALARM;
                         if (global_status != ALARM) {
                             screen = ALARM_SCREEN;
                             print_screen(screen);
                         }
+                        if (global_status != ALARM) {
+                            Buzzer_on();
+                        }
                         global_status = ALARM;
                     }
+                    reed_open[i] = true;
                 }
                 else {
                     reed_trigger_count[i] = 0;
+                    reed_open[i] = false;
+                }
+                if (reed_open[i] != last_reading) {
+                    print_screen(screen);
                 }
             }
             check_count = 0;
         }
-        if (rtc - last_light >= 3000) {
+
+        /* Check Microphone */
+        if (ADCState == 0) {
+            ADCState = 1; //Set flag to indicate ADC is busy - ADC ISR (interrupt) will clear it
+            ADC_startConversion(ADC_BASE, ADC_SINGLECHANNEL);
+        }
+        mic_data[0] = mic_data[1];
+        mic_data[1] = mic_data[2];
+        mic_data[2] = mic_data[3];
+        mic_data[3] = ADCResult;
+
+        int simpsons38th = ((3 * (3)) / 8) * (mic_data[0] + (3 * mic_data[1]) + (3 * mic_data[2]) + mic_data[3]);
+        if (screen != SET_PASSWORD_SCREEN && zone_armed[0] && simpsons38th > 5000) {
+            zone_status[0] = ALARM;
+            if (global_status != ALARM) {
+                Buzzer_on();
+                screen = ALARM_SCREEN;
+                print_screen(screen);
+            }
+            global_status = ALARM;
+        }
+
+        if (simpsons38th > max_mic_reading) {
+            max_mic_reading = simpsons38th;
+        }
+
+        bool update = screen == HOME_SCREEN;
+        if (last_screen != screen && update) {
+            last_mic_strlen = num_digits(max_mic_reading);
+            Terminal_printf("\r\n----------------------------------------------------------\r\n");
+            Terminal_printf("\r\nMicrophone reading: ---- [                    ]");
+            last_mic_update = rtc;
+        }
+        else if (rtc - last_mic_update >= 5000 && update) {
+            int i;
+            for (i = 0; i < last_mic_strlen + 23; i++) {
+                Terminal_printf("\x08");
+            }
+            Terminal_printf("%d", max_mic_reading);
+            Terminal_printf(" [");
+            int threshold = (20 * (max_mic_reading - 4500)) / 500;
+            for (i = 0; i < 20; i++) {
+                if (i <= threshold) {
+                    Terminal_printf("#");
+                }
+                else {
+                    Terminal_printf(" ");
+                }
+            }
+            Terminal_printf("]");
+            last_mic_strlen = num_digits(max_mic_reading);
+            last_mic_update = rtc;
+            max_mic_reading = 0;
+        }
+
+        if (rtc - last_light >= 5000) {
             int i;
             for (i = 0; i < 4; i++) {
                 if (zone_status[i] == ALARM) {
